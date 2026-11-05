@@ -23,7 +23,7 @@ globals.localStorage = memoryStorage;
 globals.window = { indexedDB, addEventListener: () => undefined };
 globals.document = { addEventListener: () => undefined, visibilityState: 'visible' };
 
-const { db, BACKUP_STORES, BackupConflictError } = await import('../src/services/storage.ts');
+const { db, BACKUP_STORES, BackupConflictError, backupDataDeepEqual } = await import('../src/services/storage.ts');
 const { autoSave } = await import('../src/services/autoSave.ts');
 
 async function resetTestData() {
@@ -82,13 +82,106 @@ test('queued autosaves finish before export and failed writes prevent flush succ
   await autoSave.immediateSave('backup-flush-failure-test', async () => undefined);
 });
 
-test('conflicting IndexedDB and fallback records stop export and retain both originals', async () => {
+test('identical records with different property insertion order are deduplicated without conflict', async () => {
   await resetTestData();
-  await seedRecord('projects', { id: 'same-id', name: 'IndexedDB copy' });
-  memoryStorage.setItem('mft_projects_same-id', JSON.stringify({ id: 'same-id', name: 'LocalStorage copy' }));
-  await assert.rejects(db.exportBackup(), (error: unknown) => error instanceof BackupConflictError && /projects\/same-id/.test(error.message));
-  assert.equal((await db.get('projects', 'same-id') as any)?.name, 'IndexedDB copy');
-  assert.equal(JSON.parse(memoryStorage.getItem('mft_projects_same-id')!).name, 'LocalStorage copy');
+  const indexedDbRecord = { id: 'same-order', description: 'Concrete', amount: 1250, status: 'paid' };
+  await seedRecord('transactions', indexedDbRecord);
+  memoryStorage.setItem('mft_transactions_same-order', JSON.stringify({ status: 'paid', amount: 1250, id: 'same-order', description: 'Concrete' }));
+
+  const backup = JSON.parse(await db.exportBackup());
+  assert.equal(backup.data.transactions.length, 1);
+  assert.deepEqual(backup.data.transactions[0], indexedDbRecord);
+});
+
+test('identical records with nested objects in different insertion order are deduplicated', async () => {
+  await resetTestData();
+  const indexedDbRecord = {
+    id: 'same-nested',
+    amount: 2800,
+    details: { category: 'Materials', vendor: { name: 'North Supply', city: 'Bacolod' } },
+  };
+  await seedRecord('transactions', indexedDbRecord);
+  memoryStorage.setItem('mft_transactions_same-nested', JSON.stringify({
+    details: { vendor: { city: 'Bacolod', name: 'North Supply' }, category: 'Materials' },
+    id: 'same-nested',
+    amount: 2800,
+  }));
+
+  const backup = JSON.parse(await db.exportBackup());
+  assert.equal(backup.data.transactions.length, 1);
+  assert.deepEqual(backup.data.transactions[0], indexedDbRecord);
+});
+
+test('four synthetic Transaction-schema pairs with undefined transferToMethod export without conflicts', async () => {
+  await resetTestData();
+  const records = [
+    { id: 'fixture-transaction-1', projectId: 'project-a', type: 'expense', amount: 1250, category: 'Materials', paymentMethod: 'Cash', paymentStatus: 'paid', date: '2026-05-01', time: '08:30', description: 'Delivery', supplierOrPayee: 'North Supply', notes: 'Synthetic fixture', transferToMethod: undefined, isEquityOrLoan: false, createdAt: 1001, updatedAt: 1001 },
+    { id: 'fixture-transaction-2', projectId: 'project-a', type: 'expense', amount: 3400, category: 'Labor', paymentMethod: 'GCash', paymentStatus: 'unpaid', date: '2026-05-02', time: '09:15', description: 'Worker payment', supplierOrPayee: 'Worker A', notes: 'Synthetic fixture', transferToMethod: undefined, isEquityOrLoan: false, createdAt: 1002, updatedAt: 1002 },
+    { id: 'fixture-transaction-3', projectId: 'project-b', type: 'income', amount: 7800, category: 'Collection', paymentMethod: 'Bank', paymentStatus: 'paid', date: '2026-05-03', time: '10:00', description: 'Progress billing', supplierOrPayee: 'Client B', notes: 'Synthetic fixture', transferToMethod: undefined, isEquityOrLoan: true, createdAt: 1003, updatedAt: 1003 },
+    { id: 'fixture-transaction-4', projectId: 'project-b', type: 'transfer', amount: 510, category: 'Transfer', paymentMethod: 'Cash', paymentStatus: 'paid', date: '2026-05-04', time: '11:45', description: 'Cash to GCash', supplierOrPayee: 'Internal transfer', notes: 'Synthetic fixture', transferToMethod: undefined, isEquityOrLoan: false, createdAt: 1004, updatedAt: 1004 },
+  ];
+  for (const record of records) {
+    await seedRecord('transactions', record);
+    memoryStorage.setItem(`mft_transactions_${record.id}`, JSON.stringify(Object.fromEntries(Object.entries(record).reverse())));
+  }
+
+  const backup = JSON.parse(await db.exportBackup());
+  assert.equal(backup.data.transactions.length, 4);
+  assert.equal(backup.metadata.recordCounts.transactions, 4);
+  assert.equal(backup.metadata.fallbackRecordCounts.transactions, 4);
+});
+
+test('record equality compares values and fields without requiring the same object prototype', () => {
+  const indexedDbShape = Object.assign(Object.create({ source: 'IndexedDB' }), { id: 'prototype-data', details: { amount: 450 } });
+  const localStorageShape = { details: { amount: 450 }, id: 'prototype-data' };
+  assert.equal(backupDataDeepEqual(indexedDbShape, localStorageShape), true);
+});
+
+test('undefined object properties equal missing properties, including recursively', () => {
+  assert.equal(backupDataDeepEqual({ transferToMethod: undefined }, {}), true);
+  assert.equal(backupDataDeepEqual({ details: { transferToMethod: undefined } }, { details: {} }), true);
+});
+
+test('null and actual value differences remain distinct from missing properties', () => {
+  assert.equal(backupDataDeepEqual({ transferToMethod: null }, {}), false);
+  assert.equal(backupDataDeepEqual({ amount: 100 }, { amount: 101 }), false);
+  assert.equal(backupDataDeepEqual({ label: 'Cash' }, { label: 'GCash' }), false);
+  assert.equal(backupDataDeepEqual({ enabled: false }, {}), false);
+});
+
+test('different transaction amounts remain a conflict and neither copy is changed', async () => {
+  await resetTestData();
+  await seedRecord('transactions', { id: 'different-amount', amount: 100 });
+  memoryStorage.setItem('mft_transactions_different-amount', JSON.stringify({ id: 'different-amount', amount: 101 }));
+  await assert.rejects(db.exportBackup(), (error: unknown) => {
+    if (!(error instanceof BackupConflictError) || !/transactions\/different-amount/.test(error.message)) return false;
+    assert.deepEqual(error.conflicts[0].differences.map((difference) => difference.field), ['amount']);
+    assert.equal(error.conflicts[0].differences[0].indexedDBValue, 100);
+    assert.equal(error.conflicts[0].differences[0].localStorageValue, 101);
+    return true;
+  });
+  assert.equal((await db.get('transactions', 'different-amount') as any)?.amount, 100);
+  assert.equal(JSON.parse(memoryStorage.getItem('mft_transactions_different-amount')!).amount, 101);
+});
+
+test('missing or additional record fields remain conflicts', async () => {
+  await resetTestData();
+  await seedRecord('transactions', { id: 'missing-field', amount: 100, note: 'Original field' });
+  await seedRecord('transactions', { id: 'additional-field', amount: 200 });
+  memoryStorage.setItem('mft_transactions_missing-field', JSON.stringify({ id: 'missing-field', amount: 100 }));
+  memoryStorage.setItem('mft_transactions_additional-field', JSON.stringify({ id: 'additional-field', amount: 200, note: 'Extra field' }));
+
+  await assert.rejects(db.exportBackup(), (error: unknown) => {
+    if (!(error instanceof BackupConflictError)) return false;
+    assert.deepEqual(error.conflicts.map((conflict) => conflict.id).sort(), ['additional-field', 'missing-field']);
+    assert.deepEqual(error.conflicts.find((conflict) => conflict.id === 'missing-field')?.differences.map((difference) => difference.field), ['note']);
+    assert.deepEqual(error.conflicts.find((conflict) => conflict.id === 'additional-field')?.differences.map((difference) => difference.field), ['note']);
+    return true;
+  });
+  assert.equal((await db.get('transactions', 'missing-field') as any)?.note, 'Original field');
+  assert.equal(JSON.parse(memoryStorage.getItem('mft_transactions_missing-field')!).note, undefined);
+  assert.equal((await db.get('transactions', 'additional-field') as any)?.note, undefined);
+  assert.equal(JSON.parse(memoryStorage.getItem('mft_transactions_additional-field')!).note, 'Extra field');
 });
 
 test('version 2 restore remains supported and preserves current pending payment records', async () => {

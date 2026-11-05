@@ -32,6 +32,16 @@ interface BackupManagerPlugin {
 
 const BackupManager = registerPlugin<BackupManagerPlugin>('BackupManager');
 
+function formatConflictValue(value: unknown, present: boolean): string {
+  if (!present) return '<missing>';
+  try {
+    const rendered = JSON.stringify(value);
+    return rendered === undefined ? 'undefined' : rendered;
+  } catch {
+    return String(value);
+  }
+}
+
 export const SettingsView: React.FC<{ onOpenContractorSetup: () => void }> = ({
   onOpenContractorSetup,
 }) => {
@@ -347,6 +357,13 @@ export const SettingsView: React.FC<{ onOpenContractorSetup: () => void }> = ({
               {backupConflictDetails.map((conflict) => (
                 <div key={`${conflict.storeName}:${conflict.id}`}>
                   <p className="font-extrabold">{conflict.storeName} / {conflict.id}</p>
+                  <ul className="mt-1 space-y-1">
+                    {conflict.differences.map((difference) => (
+                      <li key={difference.field} className="break-all">
+                        <code className="font-bold">{difference.field}</code>: IndexedDB={formatConflictValue(difference.indexedDBValue, difference.indexedDBPresent)}; LocalStorage={formatConflictValue(difference.localStorageValue, difference.localStoragePresent)}
+                      </li>
+                    ))}
+                  </ul>
                   <p className="mt-1 font-bold">IndexedDB copy</p>
                   <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded bg-white/70 p-2 dark:bg-black/20">{JSON.stringify(conflict.indexedDBRecord, null, 2)}</pre>
                   <p className="mt-1 font-bold">LocalStorage fallback copy</p>

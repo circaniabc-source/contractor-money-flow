@@ -47,11 +47,20 @@ export interface BackupConflict {
   id: string;
   indexedDBRecord: unknown;
   localStorageRecord: unknown;
+  differences: BackupValueDifference[];
+}
+
+export interface BackupValueDifference {
+  field: string;
+  indexedDBPresent: boolean;
+  localStoragePresent: boolean;
+  indexedDBValue: unknown;
+  localStorageValue: unknown;
 }
 
 export class BackupConflictError extends Error {
   constructor(public readonly conflicts: BackupConflict[]) {
-    super(`Backup stopped: ${conflicts.length} IndexedDB/LocalStorage record conflict(s). ${conflicts.map((item) => `${item.storeName}/${item.id}`).join(', ')}`);
+    super(`Backup stopped: ${conflicts.length} IndexedDB/LocalStorage record conflict(s). ${conflicts.map((item) => `${item.storeName}/${item.id} [${item.differences.map((difference) => difference.field).join(', ')}]`).join('; ')}`);
     this.name = 'BackupConflictError';
   }
 }
@@ -64,12 +73,86 @@ type StoreName = (typeof BACKUP_STORES)[number];
 type StoreRecords = Record<StoreName, Array<Record<string, unknown> & { id: string }>>;
 type RecoverySnapshot = { stores: StoreRecords; localStorageEntries: Array<[string, string]> };
 
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  if (value && typeof value === 'object') {
-    return `{${Object.keys(value as object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(',')}}`;
+export function backupDataDeepEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (left instanceof Date || right instanceof Date) {
+    return left instanceof Date && right instanceof Date && left.getTime() === right.getTime();
   }
-  return JSON.stringify(value);
+  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false;
+
+  const leftIsArray = Array.isArray(left);
+  if (leftIsArray !== Array.isArray(right)) return false;
+  if (leftIsArray && (left as unknown[]).length !== (right as unknown[]).length) return false;
+
+  // Compare record data rather than prototypes; structured cloning and JSON parsing
+  // can yield equivalent records with different prototypes.
+  if (left instanceof Map || right instanceof Map || left instanceof Set || right instanceof Set ||
+      left instanceof RegExp || right instanceof RegExp || left instanceof ArrayBuffer || right instanceof ArrayBuffer ||
+      ArrayBuffer.isView(left) || ArrayBuffer.isView(right)) return false;
+
+  // JSON serialization omits undefined object properties. IndexedDB structured
+  // clones retain them, so compare object keys after applying JSON's omission
+  // semantics. Array slots remain positional and are intentionally unchanged.
+  const leftKeys = Object.keys(left).filter((key) => leftIsArray || (left as Record<string, unknown>)[key] !== undefined).sort();
+  const rightKeys = Object.keys(right).filter((key) => leftIsArray || (right as Record<string, unknown>)[key] !== undefined).sort();
+  if (leftKeys.length !== rightKeys.length) return false;
+  for (let index = 0; index < leftKeys.length; index++) {
+    const key = leftKeys[index];
+    if (key !== rightKeys[index] || !backupDataDeepEqual(
+      (left as Record<string, unknown>)[key],
+      (right as Record<string, unknown>)[key]
+    )) return false;
+  }
+  return true;
+}
+
+function findBackupValueDifferences(left: unknown, right: unknown, path = '$'): BackupValueDifference[] {
+  if (Object.is(left, right)) return [];
+  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') {
+    return [{ field: path, indexedDBPresent: true, localStoragePresent: true, indexedDBValue: left, localStorageValue: right }];
+  }
+
+  const leftIsArray = Array.isArray(left);
+  if (leftIsArray !== Array.isArray(right)) {
+    return [{ field: path, indexedDBPresent: true, localStoragePresent: true, indexedDBValue: left, localStorageValue: right }];
+  }
+
+  const differences: BackupValueDifference[] = [];
+  if (leftIsArray && (left as unknown[]).length !== (right as unknown[]).length) {
+    differences.push({
+      field: `${path}.length`,
+      indexedDBPresent: true,
+      localStoragePresent: true,
+      indexedDBValue: (left as unknown[]).length,
+      localStorageValue: (right as unknown[]).length,
+    });
+  }
+
+  if (left instanceof Date || right instanceof Date) {
+    differences.push({ field: path, indexedDBPresent: true, localStoragePresent: true, indexedDBValue: String(left), localStorageValue: String(right) });
+    return differences;
+  }
+  if (left instanceof Map || right instanceof Map || left instanceof Set || right instanceof Set ||
+      left instanceof RegExp || right instanceof RegExp || left instanceof ArrayBuffer || right instanceof ArrayBuffer ||
+      ArrayBuffer.isView(left) || ArrayBuffer.isView(right)) {
+    differences.push({ field: path, indexedDBPresent: true, localStoragePresent: true, indexedDBValue: String(left), localStorageValue: String(right) });
+    return differences;
+  }
+
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+  const allKeys = [...new Set([...leftKeys, ...rightKeys])].sort();
+  for (const key of allKeys) {
+    const leftPresent = Object.prototype.hasOwnProperty.call(left, key);
+    const rightPresent = Object.prototype.hasOwnProperty.call(right, key);
+    const field = leftIsArray && /^\d+$/.test(key) ? `${path}[${key}]` : path === '$' ? key : `${path}.${key}`;
+    if (leftPresent !== rightPresent) {
+      differences.push({ field, indexedDBPresent: leftPresent, localStoragePresent: rightPresent, indexedDBValue: (left as Record<string, unknown>)[key], localStorageValue: (right as Record<string, unknown>)[key] });
+    } else {
+      differences.push(...findBackupValueDifferences((left as Record<string, unknown>)[key], (right as Record<string, unknown>)[key], field));
+    }
+  }
+  return differences;
 }
 
 function validRecordArray(value: unknown): value is Array<Record<string, unknown> & { id: string }> {
@@ -290,8 +373,14 @@ class LocalStorageEngine {
         const indexedRecord = byId.get(localRecord.id);
         if (!indexedRecord) {
           records[store].push(localRecord);
-        } else if (canonicalJson(indexedRecord) !== canonicalJson(localRecord)) {
-          conflicts.push({ storeName: store, id: localRecord.id, indexedDBRecord: indexedRecord, localStorageRecord: localRecord });
+        } else if (!backupDataDeepEqual(indexedRecord, localRecord)) {
+          conflicts.push({
+            storeName: store,
+            id: localRecord.id,
+            indexedDBRecord: indexedRecord,
+            localStorageRecord: localRecord,
+            differences: findBackupValueDifferences(indexedRecord, localRecord),
+          });
         }
       }
     }
@@ -355,7 +444,7 @@ class LocalStorageEngine {
           return { valid: false, error: `Record count verification failed for ${store}.` };
         }
         const merged = new Map(parsed.data[store].map((record: any) => [record.id, record]));
-        if (fallbackRecords.some((record: any) => !merged.has(record.id) || canonicalJson(merged.get(record.id)) !== canonicalJson(record))) {
+        if (fallbackRecords.some((record: any) => !merged.has(record.id) || !backupDataDeepEqual(merged.get(record.id), record))) {
           return { valid: false, error: `Fallback records do not match the verified ${store} records.` };
         }
       }
