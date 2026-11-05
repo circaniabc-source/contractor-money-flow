@@ -20,6 +20,7 @@ import { getSampleContractorData } from '../services/sampleData';
 
 interface AppContextType {
   isLoading: boolean;
+  storageRecoveryError: string | null;
   saveStatus: SaveStatus;
   lastSavedAt: Date;
 
@@ -107,6 +108,7 @@ const AppContext = createContext<AppContextType | undefined>(undefined);
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [isLoading, setIsLoading] = useState(true);
+  const [storageRecoveryError, setStorageRecoveryError] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('saved');
   const [lastSavedAt, setLastSavedAt] = useState<Date>(new Date());
 
@@ -153,6 +155,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   useEffect(() => {
     async function loadInitialData() {
       try {
+        try {
+          await db.recoverInterruptedRestore();
+        } catch (recoveryError) {
+          setStorageRecoveryError(recoveryError instanceof Error ? recoveryError.message : 'Backup recovery could not finish.');
+          throw recoveryError;
+        }
         const storedProfile = await db.get<ContractorProfile>('contractor_profile', 'contractor_profile_1');
         const storedSettings = await db.get<AppSettings>('keyval', 'app_settings');
         const storedProjects = await db.getAll<Project>('projects');
@@ -623,6 +631,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     <AppContext.Provider
       value={{
         isLoading,
+        storageRecoveryError,
         saveStatus,
         lastSavedAt,
         profile,

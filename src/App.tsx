@@ -25,6 +25,7 @@ import { Plus, Loader2 } from 'lucide-react';
 function MainApp() {
   const {
     isLoading,
+    storageRecoveryError,
     isSetupComplete,
     isPinLocked,
     projects,
@@ -53,6 +54,17 @@ function MainApp() {
         <span className="text-xs font-bold tracking-wider uppercase text-slate-400">
           Loading Contractor Money Flow...
         </span>
+      </div>
+    );
+  }
+
+  if (storageRecoveryError) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center px-6 text-center text-white">
+        <h1 className="text-lg font-extrabold">Backup recovery needs attention</h1>
+        <p className="mt-3 max-w-sm text-sm text-slate-300">{storageRecoveryError}</p>
+        <p className="mt-2 max-w-sm text-xs text-slate-400">Your project screens are paused to prevent new changes until the saved recovery snapshot can be applied.</p>
+        <button type="button" onClick={() => window.location.reload()} className="mt-5 rounded-xl bg-amber-500 px-4 py-2 text-sm font-bold text-slate-950">Retry recovery</button>
       </div>
     );
   }

@@ -17,7 +17,7 @@ class AutoSaveManager {
   private listeners: Set<Listener> = new Set();
   private timers: Map<string, any> = new Map();
   private pendingSaves: Map<string, () => Promise<void>> = new Map();
-  private isProcessing = false;
+  private runningSaves: Map<string, Promise<boolean>> = new Map();
 
   constructor() {
     this.setupLifecycleListeners();
@@ -75,18 +75,9 @@ class AutoSaveManager {
       clearTimeout(this.timers.get(key));
     }
 
-    const timer = setTimeout(async () => {
+    const timer = setTimeout(() => {
       this.timers.delete(key);
-      try {
-        await task();
-        this.pendingSaves.delete(key);
-        if (this.pendingSaves.size === 0) {
-          this.setStatus('saved');
-        }
-      } catch (err) {
-        console.error(`Auto-save failed for ${key}:`, err);
-        this.setStatus('error');
-      }
+      void this.runPendingSave(key);
     }, delayMs);
 
     this.timers.set(key, timer);
@@ -104,36 +95,65 @@ class AutoSaveManager {
     this.setStatus('saving');
     this.pendingSaves.set(key, task);
 
-    try {
-      await task();
-      this.pendingSaves.delete(key);
-      if (this.pendingSaves.size === 0) {
-        this.setStatus('saved');
-      }
-    } catch (err) {
-      console.error(`Immediate auto-save failed for ${key}:`, err);
-      this.setStatus('error');
+    await this.runPendingSave(key);
+  }
+
+  private async runPendingSave(key: string): Promise<boolean> {
+    const running = this.runningSaves.get(key);
+    if (running) {
+      const succeeded = await running;
+      if (this.runningSaves.get(key) === running) this.runningSaves.delete(key);
+      if (!succeeded) return false;
+      return this.pendingSaves.has(key) ? this.runPendingSave(key) : true;
     }
+
+    const task = this.pendingSaves.get(key);
+    if (!task) return true;
+
+    const run = (async () => {
+      try {
+        await task();
+        if (this.pendingSaves.get(key) === task) this.pendingSaves.delete(key);
+        return true;
+      } catch (err) {
+        console.error(`Auto-save failed for ${key}:`, err);
+        this.setStatus('error');
+        return false;
+      }
+    })();
+    this.runningSaves.set(key, run);
+    const succeeded = await run;
+    if (this.runningSaves.get(key) === run) this.runningSaves.delete(key);
+    if (succeeded && this.pendingSaves.size === 0 && this.runningSaves.size === 0) {
+      this.setStatus('saved');
+    }
+    return succeeded;
   }
 
   /**
    * Flush all pending timers and callbacks immediately
    */
   public async flush(): Promise<void> {
-    const tasks = Array.from(this.pendingSaves.entries());
     this.timers.forEach((t) => clearTimeout(t));
     this.timers.clear();
 
-    if (tasks.length === 0) return;
+    if (this.pendingSaves.size === 0 && this.runningSaves.size === 0) return;
 
     this.setStatus('saving');
-    for (const [key, task] of tasks) {
-      try {
-        await task();
-        this.pendingSaves.delete(key);
-      } catch (err) {
-        console.error(`Error flushing task ${key}:`, err);
+    const failedKeys = new Set<string>();
+    while (this.pendingSaves.size > 0 || this.runningSaves.size > 0) {
+      const keys = new Set([...this.pendingSaves.keys(), ...this.runningSaves.keys()]);
+      const results = await Promise.all([...keys].map(async (key) => [key, await this.runPendingSave(key)] as const));
+      results.forEach(([key, succeeded]) => {
+        if (!succeeded) failedKeys.add(key);
+        else failedKeys.delete(key);
+      });
+      if (failedKeys.size > 0) {
+        throw new Error(`Autosave could not finish for: ${[...failedKeys].join(', ')}`);
       }
+    }
+    if (this.pendingSaves.size > 0 || this.runningSaves.size > 0) {
+      throw new Error('Autosave writes are still pending.');
     }
     this.setStatus('saved');
   }
@@ -142,14 +162,9 @@ class AutoSaveManager {
     this.timers.forEach((t) => clearTimeout(t));
     this.timers.clear();
     // In browser sync unload, try running all registered pending tasks
-    this.pendingSaves.forEach((task, key) => {
-      try {
-        task();
-      } catch (e) {
-        // Ignore in sync exit
-      }
+    this.pendingSaves.forEach((_task, key) => {
+      void this.runPendingSave(key);
     });
-    this.pendingSaves.clear();
   }
 
   // Draft persistence helper

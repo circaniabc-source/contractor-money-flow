@@ -27,6 +27,95 @@ export interface DBStores {
   keyval: string;
 }
 
+export interface BackupSummary {
+  version: 2 | 3;
+  createdAt?: string;
+  applicationVersion?: string;
+  recordCounts: Record<(typeof BACKUP_STORES)[number], number>;
+  fallbackRecordCounts: Record<(typeof BACKUP_STORES)[number], number>;
+  pendingPaymentCount: number;
+}
+
+export interface BackupValidationResult {
+  valid: boolean;
+  summary?: BackupSummary;
+  error?: string;
+}
+
+export interface BackupConflict {
+  storeName: (typeof BACKUP_STORES)[number];
+  id: string;
+  indexedDBRecord: unknown;
+  localStorageRecord: unknown;
+}
+
+export class BackupConflictError extends Error {
+  constructor(public readonly conflicts: BackupConflict[]) {
+    super(`Backup stopped: ${conflicts.length} IndexedDB/LocalStorage record conflict(s). ${conflicts.map((item) => `${item.storeName}/${item.id}`).join(', ')}`);
+    this.name = 'BackupConflictError';
+  }
+}
+
+const PENDING_PAYMENTS_KEY = 'cmf_manual_gcash_pending_payments';
+const RECOVERY_DB_NAME = 'ContractorMoneyFlow_BackupRecovery';
+const RECOVERY_STORE_NAME = 'recovery';
+const RECOVERY_JOURNAL_ID = 'active-restore';
+type StoreName = (typeof BACKUP_STORES)[number];
+type StoreRecords = Record<StoreName, Array<Record<string, unknown> & { id: string }>>;
+type RecoverySnapshot = { stores: StoreRecords; localStorageEntries: Array<[string, string]> };
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value as object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function validRecordArray(value: unknown): value is Array<Record<string, unknown> & { id: string }> {
+  if (!Array.isArray(value)) return false;
+  const ids = new Set<string>();
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item) || typeof item.id !== 'string' || !item.id.trim() || ids.has(item.id)) return false;
+    if (Object.prototype.hasOwnProperty.call(item, '__proto__')) return false;
+    ids.add(item.id);
+  }
+  return true;
+}
+
+function emptyStoreRecords(): StoreRecords {
+  return Object.fromEntries(BACKUP_STORES.map((store) => [store, []])) as unknown as StoreRecords;
+}
+
+function validPendingPayments(value: unknown): value is Array<Record<string, unknown> & { id: string; planId: string; referenceNumber: string; submittedAt: string; status: 'pending' }> {
+  if (!Array.isArray(value)) return false;
+  const ids = new Set<string>();
+  return value.every((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item) ||
+      typeof item.id !== 'string' || !item.id.trim() || ids.has(item.id) ||
+      typeof item.planId !== 'string' || !item.planId.trim() ||
+      typeof item.referenceNumber !== 'string' || !item.referenceNumber.trim() ||
+      typeof item.submittedAt !== 'string' || Number.isNaN(Date.parse(item.submittedAt)) ||
+      item.status !== 'pending') return false;
+    ids.add(item.id);
+    return true;
+  });
+}
+
+function openRecoveryDatabase(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(RECOVERY_DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const recoveryDb = request.result;
+      if (!recoveryDb.objectStoreNames.contains(RECOVERY_STORE_NAME)) {
+        recoveryDb.createObjectStore(RECOVERY_STORE_NAME, { keyPath: 'id' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('Could not open restore recovery storage.'));
+  });
+}
+
 class LocalStorageEngine {
   private dbPromise: Promise<IDBDatabase> | null = null;
   private memoryCache: Map<string, any> = new Map();
@@ -146,6 +235,142 @@ class LocalStorageEngine {
     }
   }
 
+  private readRecognizedLocalStorageEntries(): Array<[string, string]> {
+    const prefixes = BACKUP_STORES.map((store) => `mft_${store}_`);
+    const entries: Array<[string, string]> = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && (key === PENDING_PAYMENTS_KEY || prefixes.some((prefix) => key.startsWith(prefix)))) {
+        const value = localStorage.getItem(key);
+        if (value !== null) entries.push([key, value]);
+      }
+    }
+    return entries;
+  }
+
+  private getLocalStorageFallbackRecords(): StoreRecords {
+    const fallback = emptyStoreRecords();
+    for (const [key, raw] of this.readRecognizedLocalStorageEntries()) {
+      const store = BACKUP_STORES.find((name) => key.startsWith(`mft_${name}_`));
+      if (!store) continue;
+      let item: unknown;
+      try { item = JSON.parse(raw); } catch { throw new Error(`Unreadable LocalStorage fallback record: ${key}`); }
+      const expectedId = key.slice(`mft_${store}_`.length);
+      if (!item || typeof item !== 'object' || Array.isArray(item) || typeof (item as any).id !== 'string' || (item as any).id !== expectedId) {
+        throw new Error(`Invalid LocalStorage fallback record: ${key}`);
+      }
+      if (fallback[store].some((record) => record.id === expectedId)) {
+        throw new Error(`Duplicate LocalStorage fallback key for ${store}/${expectedId}`);
+      }
+      fallback[store].push(item as Record<string, unknown> & { id: string });
+    }
+    return fallback;
+  }
+
+  private async getCurrentStoreRecords(): Promise<StoreRecords> {
+    const current = emptyStoreRecords();
+    for (const store of BACKUP_STORES) {
+      const objectStore = await this.getStore(store, 'readonly');
+      current[store] = await new Promise((resolve, reject) => {
+        const request = objectStore.getAll();
+        request.onsuccess = () => resolve((request.result as StoreRecords[typeof store]) || []);
+        request.onerror = () => reject(request.error || new Error(`Could not snapshot IndexedDB store ${store}.`));
+      });
+    }
+    return current;
+  }
+
+  private mergeStoreRecords(indexedDb: StoreRecords, fallback: StoreRecords): { records: StoreRecords; conflicts: BackupConflict[] } {
+    const records = emptyStoreRecords();
+    const conflicts: BackupConflict[] = [];
+    for (const store of BACKUP_STORES) {
+      const byId = new Map(indexedDb[store].map((record) => [record.id, record]));
+      records[store] = [...indexedDb[store]];
+      for (const localRecord of fallback[store]) {
+        const indexedRecord = byId.get(localRecord.id);
+        if (!indexedRecord) {
+          records[store].push(localRecord);
+        } else if (canonicalJson(indexedRecord) !== canonicalJson(localRecord)) {
+          conflicts.push({ storeName: store, id: localRecord.id, indexedDBRecord: indexedRecord, localStorageRecord: localRecord });
+        }
+      }
+    }
+    return { records, conflicts };
+  }
+
+  private summarizeV2(parsed: any): BackupValidationResult {
+    const requiredStores = BACKUP_STORES.filter((store) => store !== 'drafts');
+    if (!parsed.data || typeof parsed.data !== 'object' || Array.isArray(parsed.data)) return { valid: false, error: 'Backup data section is missing.' };
+    const names = Object.keys(parsed.data);
+    if (requiredStores.some((store) => !Object.hasOwn(parsed.data, store)) || names.length < requiredStores.length || names.length > BACKUP_STORES.length || names.some((store) => !BACKUP_STORES.includes(store as StoreName))) {
+      return { valid: false, error: 'Backup is missing a required data store or contains an unsupported store.' };
+    }
+    const counts = {} as BackupSummary['recordCounts'];
+    const fallbackCounts = {} as BackupSummary['fallbackRecordCounts'];
+    for (const store of BACKUP_STORES) {
+      const items = parsed.data[store] ?? (store === 'drafts' ? [] : undefined);
+      if (!validRecordArray(items)) return { valid: false, error: `Backup records are invalid in ${store}.` };
+      if (store === 'keyval' && items.some((item) => !Object.hasOwn(item, 'value'))) return { valid: false, error: 'Backup settings records are invalid.' };
+      counts[store] = items.length;
+      fallbackCounts[store] = 0;
+    }
+    return {
+      valid: true,
+      summary: { version: 2, createdAt: typeof parsed.exportedAt === 'string' ? parsed.exportedAt : undefined, recordCounts: counts, fallbackRecordCounts: fallbackCounts, pendingPaymentCount: 0 },
+    };
+  }
+
+  public validateBackup(jsonString: string): BackupValidationResult {
+    try {
+      const parsed = JSON.parse(jsonString);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || parsed.appName !== 'Contractor Money Flow') return { valid: false, error: 'Backup application identity is invalid.' };
+      if (parsed.version === 2) return this.summarizeV2(parsed);
+      if (parsed.version !== 3 || !parsed.data || typeof parsed.data !== 'object' || Array.isArray(parsed.data)) return { valid: false, error: 'Backup version or data section is unsupported.' };
+
+      const names = Object.keys(parsed.data);
+      if (names.length !== BACKUP_STORES.length + 1 || BACKUP_STORES.some((store) => !Object.hasOwn(parsed.data, store)) || !Object.hasOwn(parsed.data, 'pendingGcashPayments')) {
+        return { valid: false, error: 'Version 3 backup is incomplete.' };
+      }
+      const counts = {} as BackupSummary['recordCounts'];
+      const fallbackCounts = {} as BackupSummary['fallbackRecordCounts'];
+      for (const store of BACKUP_STORES) {
+        const records = parsed.data[store];
+        if (!validRecordArray(records)) return { valid: false, error: `Backup records are invalid in ${store}.` };
+        if (store === 'keyval' && records.some((item) => !Object.hasOwn(item, 'value'))) return { valid: false, error: 'Backup settings records are invalid.' };
+        counts[store] = records.length;
+      }
+      if (!validPendingPayments(parsed.data.pendingGcashPayments)) return { valid: false, error: 'Pending GCash payment records are invalid.' };
+      const metadata = parsed.metadata;
+      if (!metadata || typeof metadata !== 'object' || typeof metadata.createdAt !== 'string' || Number.isNaN(Date.parse(metadata.createdAt)) || typeof metadata.applicationVersion !== 'string' || !metadata.recordCounts || !metadata.fallbackRecordCounts) {
+        return { valid: false, error: 'Backup metadata is invalid.' };
+      }
+      if (!parsed.fallbackRecords || typeof parsed.fallbackRecords !== 'object' || Array.isArray(parsed.fallbackRecords) || BACKUP_STORES.some((store) => !Object.hasOwn(parsed.fallbackRecords, store))) {
+        return { valid: false, error: 'Fallback record section is incomplete.' };
+      }
+      for (const store of BACKUP_STORES) {
+        const fallbackRecords = parsed.fallbackRecords[store];
+        if (!validRecordArray(fallbackRecords)) return { valid: false, error: `Fallback records are invalid in ${store}.` };
+        fallbackCounts[store] = fallbackRecords.length;
+        if (metadata.recordCounts[store] !== counts[store] || metadata.fallbackRecordCounts[store] !== fallbackRecords.length) {
+          return { valid: false, error: `Record count verification failed for ${store}.` };
+        }
+        const merged = new Map(parsed.data[store].map((record: any) => [record.id, record]));
+        if (fallbackRecords.some((record: any) => !merged.has(record.id) || canonicalJson(merged.get(record.id)) !== canonicalJson(record))) {
+          return { valid: false, error: `Fallback records do not match the verified ${store} records.` };
+        }
+      }
+      if (!metadata.indexedDBRecordCounts || BACKUP_STORES.some((store) => !Number.isInteger(metadata.indexedDBRecordCounts[store]) || metadata.indexedDBRecordCounts[store] < 0) || metadata.pendingPaymentCount !== parsed.data.pendingGcashPayments.length) {
+        return { valid: false, error: 'Backup record-count metadata is incomplete or inconsistent.' };
+      }
+      return {
+        valid: true,
+        summary: { version: 3, createdAt: metadata.createdAt, applicationVersion: metadata.applicationVersion, recordCounts: counts, fallbackRecordCounts: fallbackCounts, pendingPaymentCount: parsed.data.pendingGcashPayments.length },
+      };
+    } catch {
+      return { valid: false, error: 'Backup file is not valid JSON.' };
+    }
+  }
+
   public async put<T extends { id: string }>(storeName: string, item: T): Promise<T> {
     const cacheKey = `${storeName}:${item.id}`;
     this.memoryCache.set(cacheKey, item);
@@ -225,88 +450,214 @@ class LocalStorageEngine {
 
   // Full backup & restore
   public async exportBackup(): Promise<string> {
-    const data: Record<string, any[]> = {};
-    for (const store of BACKUP_STORES) {
-      data[store] = await this.getAll(store);
+    const indexedDbRecords = emptyStoreRecords();
+    const fallbackRecords = this.getLocalStorageFallbackRecords();
+    let indexedDb: IDBDatabase | null;
+    try {
+      indexedDb = await this.init();
+    } catch (error) {
+      throw new Error(`Could not safely read IndexedDB for backup: ${String(error)}`);
+    }
+    if (indexedDb) {
+      for (const store of BACKUP_STORES) {
+        const storeObject = await this.getStore(store, 'readonly');
+        indexedDbRecords[store] = await new Promise((resolve, reject) => {
+          const request = storeObject.getAll();
+          request.onsuccess = () => resolve((request.result as StoreRecords[typeof store]) || []);
+          request.onerror = () => reject(request.error || new Error(`Could not read IndexedDB store ${store}.`));
+        });
+      }
     }
 
-    return JSON.stringify({
-      version: 2,
+    const { records, conflicts } = this.mergeStoreRecords(indexedDbRecords, fallbackRecords);
+    if (conflicts.length) throw new BackupConflictError(conflicts);
+    for (const store of BACKUP_STORES) {
+      if (!validRecordArray(records[store])) throw new Error(`Could not safely export records in ${store}.`);
+      if (store === 'keyval' && records[store].some((item) => !Object.hasOwn(item, 'value'))) throw new Error('Could not safely export settings records.');
+    }
+
+    const paymentRaw = localStorage.getItem(PENDING_PAYMENTS_KEY);
+    let pendingGcashPayments: unknown = [];
+    if (paymentRaw !== null) {
+      try { pendingGcashPayments = JSON.parse(paymentRaw); } catch { throw new Error('The pending GCash payment list is unreadable; no backup was created.'); }
+    }
+    if (!validPendingPayments(pendingGcashPayments)) throw new Error('The pending GCash payment list is invalid; no backup was created.');
+
+    const now = new Date().toISOString();
+    const recordCounts = Object.fromEntries(BACKUP_STORES.map((store) => [store, records[store].length])) as Record<StoreName, number>;
+    const fallbackRecordCounts = Object.fromEntries(BACKUP_STORES.map((store) => [store, fallbackRecords[store].length])) as Record<StoreName, number>;
+    const indexedDBRecordCounts = Object.fromEntries(BACKUP_STORES.map((store) => [store, indexedDbRecords[store].length])) as Record<StoreName, number>;
+    const backup = {
+      version: 3,
       appName: 'Contractor Money Flow',
-      exportedAt: new Date().toISOString(),
-      data,
-    }, null, 2);
+      metadata: {
+        createdAt: now,
+        applicationVersion: import.meta.env?.VITE_APP_VERSION || '1.0',
+        recordCounts,
+        indexedDBRecordCounts,
+        fallbackRecordCounts,
+        pendingPaymentCount: pendingGcashPayments.length,
+      },
+      fallbackRecords,
+      data: { ...records, pendingGcashPayments },
+    };
+    const json = JSON.stringify(backup, null, 2);
+    const verification = this.validateBackup(json);
+    if (!verification.valid) throw new Error(`Export verification failed: ${verification.error || 'unknown validation error'}`);
+    return json;
   }
 
   public async importBackup(jsonString: string): Promise<boolean> {
     try {
-      const parsed = JSON.parse(jsonString);
-      if (
-        !parsed || typeof parsed !== 'object' ||
-        parsed.version !== 2 || parsed.appName !== 'Contractor Money Flow' ||
-        !parsed.data || typeof parsed.data !== 'object' || Array.isArray(parsed.data)
-      ) return false;
-
-      const storeNames = Object.keys(parsed.data);
-      const requiredStores = BACKUP_STORES.filter((store) => store !== 'drafts');
-      if (
-        requiredStores.some((store) => !Object.prototype.hasOwnProperty.call(parsed.data, store)) ||
-        storeNames.length < requiredStores.length || storeNames.length > BACKUP_STORES.length ||
-        storeNames.some((store) => !(BACKUP_STORES as readonly string[]).includes(store))
-      ) return false;
-
-      const backupData = { ...parsed.data, drafts: parsed.data.drafts ?? [] };
-
-      // Validate every store and record before modifying any persisted data.
-      for (const storeName of BACKUP_STORES) {
-        const items = backupData[storeName];
-        if (!Array.isArray(items)) return false;
-        const ids = new Set<string>();
-        for (const item of items) {
-          if (!item || typeof item !== 'object' || Array.isArray(item) || typeof item.id !== 'string' || !item.id.trim() || ids.has(item.id)) {
-            return false;
-          }
-          ids.add(item.id);
-          if (storeName === 'keyval' && !Object.prototype.hasOwnProperty.call(item, 'value')) return false;
-        }
-      }
-
-      const db = await this.init();
-      if (!db) return false;
-
-      // Replace all app stores in one IndexedDB transaction so a failed restore
-      // cannot leave a mixture of old and new data.
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction([...BACKUP_STORES], 'readwrite');
-        for (const storeName of BACKUP_STORES) {
-          const store = tx.objectStore(storeName);
-          store.clear();
-          for (const item of backupData[storeName]) store.put(item);
-        }
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error || new Error('Backup transaction failed'));
-        tx.onabort = () => reject(tx.error || new Error('Backup transaction was aborted'));
-      });
-
-      this.memoryCache.clear();
-      for (const storeName of BACKUP_STORES) {
-        const prefix = `mft_${storeName}_`;
-        const staleKeys: string[] = [];
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i);
-          if (key?.startsWith(prefix)) staleKeys.push(key);
-        }
-        staleKeys.forEach((key) => localStorage.removeItem(key));
-        for (const item of backupData[storeName]) {
-          this.memoryCache.set(`${storeName}:${item.id}`, item);
-          try { localStorage.setItem(`${prefix}${item.id}`, JSON.stringify(item)); } catch { /* IndexedDB remains authoritative. */ }
-        }
-      }
+      await this.restoreBackup(jsonString);
       return true;
     } catch (e) {
       console.error('Import error:', e);
       return false;
     }
+  }
+
+  public async restoreBackup(jsonString: string): Promise<BackupSummary> {
+    const validation = this.validateBackup(jsonString);
+    if (!validation.valid || !validation.summary) throw new Error(validation.error || 'Backup validation failed.');
+    const parsed = JSON.parse(jsonString);
+    const incoming = emptyStoreRecords();
+    for (const store of BACKUP_STORES) incoming[store] = (parsed.data[store] ?? (store === 'drafts' ? [] : undefined)) as StoreRecords[typeof store];
+    const restorePayments = parsed.version === 3 ? parsed.data.pendingGcashPayments as unknown[] : undefined;
+
+    const db = await this.init();
+    if (!db) throw new Error('IndexedDB is unavailable; existing data was not changed.');
+    const snapshot: RecoverySnapshot = {
+      stores: await this.getCurrentStoreRecords(),
+      localStorageEntries: this.readRecognizedLocalStorageEntries(),
+    };
+    const recoveryDb = await openRecoveryDatabase();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const tx = recoveryDb.transaction(RECOVERY_STORE_NAME, 'readwrite');
+        tx.objectStore(RECOVERY_STORE_NAME).put({ id: RECOVERY_JOURNAL_ID, phase: 'prepared', snapshot });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('Could not save the restore recovery snapshot.'));
+        tx.onabort = () => reject(tx.error || new Error('Could not save the restore recovery snapshot.'));
+      });
+    } finally {
+      recoveryDb.close();
+    }
+
+    try {
+      await this.replaceStoreRecords(db, incoming);
+      this.writeLocalStorageRecords(incoming, restorePayments);
+      const journalDb = await openRecoveryDatabase();
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const tx = journalDb.transaction(RECOVERY_STORE_NAME, 'readwrite');
+          tx.objectStore(RECOVERY_STORE_NAME).put({ id: RECOVERY_JOURNAL_ID, phase: 'committed', snapshot });
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error || new Error('Could not finalize restore recovery.'));
+          tx.onabort = () => reject(tx.error || new Error('Could not finalize restore recovery.'));
+        });
+      } finally {
+        journalDb.close();
+      }
+      this.refreshMemoryCache(incoming);
+      try { await this.removeRecoveryJournal(); } catch (cleanupError) {
+        // The committed journal is safe; startup recovery only removes its snapshot.
+        console.warn('Restore succeeded; recovery snapshot cleanup will retry on next launch.', cleanupError);
+      }
+      return validation.summary;
+    } catch (restoreError) {
+      try {
+        await this.restoreSnapshot(snapshot);
+        await this.removeRecoveryJournal();
+      } catch (rollbackError) {
+        throw new Error(`Restore failed and recovery is still pending. Keep this app open and restart it to retry recovery. Restore error: ${String(restoreError)} Recovery error: ${String(rollbackError)}`);
+      }
+      throw new Error(`Restore failed. Existing data was recovered and remains unchanged. ${String(restoreError)}`);
+    }
+  }
+
+  private async replaceStoreRecords(db: IDBDatabase, records: StoreRecords): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction([...BACKUP_STORES], 'readwrite');
+      for (const storeName of BACKUP_STORES) {
+        const store = tx.objectStore(storeName);
+        store.clear();
+        for (const item of records[storeName]) store.put(item);
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error('Backup replacement transaction failed.'));
+      tx.onabort = () => reject(tx.error || new Error('Backup replacement transaction was aborted.'));
+    });
+  }
+
+  private writeLocalStorageRecords(records: StoreRecords, payments?: unknown[]): void {
+    const keysToRemove: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && ((payments !== undefined && key === PENDING_PAYMENTS_KEY) || BACKUP_STORES.some((store) => key.startsWith(`mft_${store}_`)))) keysToRemove.push(key);
+    }
+    keysToRemove.forEach((key) => localStorage.removeItem(key));
+    for (const store of BACKUP_STORES) {
+      for (const item of records[store]) localStorage.setItem(`mft_${store}_${item.id}`, JSON.stringify(item));
+    }
+    if (payments) localStorage.setItem(PENDING_PAYMENTS_KEY, JSON.stringify(payments));
+  }
+
+  private refreshMemoryCache(records: StoreRecords): void {
+    this.memoryCache.clear();
+    for (const store of BACKUP_STORES) {
+      for (const item of records[store]) this.memoryCache.set(`${store}:${item.id}`, item);
+    }
+  }
+
+  private async restoreSnapshot(snapshot: RecoverySnapshot): Promise<void> {
+    const currentDb = await this.init();
+    if (!currentDb) throw new Error('IndexedDB is unavailable during restore recovery.');
+    await this.replaceStoreRecords(currentDb, snapshot.stores);
+    const prefixes = BACKUP_STORES.map((store) => `mft_${store}_`);
+    const keysToRemove: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && (key === PENDING_PAYMENTS_KEY || prefixes.some((prefix) => key.startsWith(prefix)))) keysToRemove.push(key);
+    }
+    keysToRemove.forEach((key) => localStorage.removeItem(key));
+    snapshot.localStorageEntries.forEach(([key, value]) => localStorage.setItem(key, value));
+    this.refreshMemoryCache(snapshot.stores);
+  }
+
+  private async removeRecoveryJournal(): Promise<void> {
+    const recoveryDb = await openRecoveryDatabase();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const tx = recoveryDb.transaction(RECOVERY_STORE_NAME, 'readwrite');
+        tx.objectStore(RECOVERY_STORE_NAME).delete(RECOVERY_JOURNAL_ID);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('Could not remove restore recovery snapshot.'));
+        tx.onabort = () => reject(tx.error || new Error('Could not remove restore recovery snapshot.'));
+      });
+    } finally {
+      recoveryDb.close();
+    }
+  }
+
+  public async recoverInterruptedRestore(): Promise<void> {
+    const recoveryDb = await openRecoveryDatabase();
+    let journal: any;
+    try {
+      journal = await new Promise((resolve, reject) => {
+        const tx = recoveryDb.transaction(RECOVERY_STORE_NAME, 'readonly');
+        const request = tx.objectStore(RECOVERY_STORE_NAME).get(RECOVERY_JOURNAL_ID);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error('Could not inspect restore recovery state.'));
+      });
+    } finally {
+      recoveryDb.close();
+    }
+    if (!journal) return;
+    if (journal.phase !== 'committed') {
+      await this.restoreSnapshot(journal.snapshot as RecoverySnapshot);
+    }
+    await this.removeRecoveryJournal();
   }
 
   public async clearAllData(): Promise<void> {
