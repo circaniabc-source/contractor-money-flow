@@ -1,0 +1,396 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ * Contractor Money Flow - Project Financial Details Screen
+ */
+
+import React, { useState, useMemo } from 'react';
+import { useApp } from '../../context/AppContext';
+import { Project, Transaction } from '../../types';
+import { formatPeso } from '../../services/categories';
+import { DeleteProjectDialog } from './DeleteProjectDialog';
+import {
+  ArrowLeft,
+  Edit2,
+  Plus,
+  ArrowDownLeft,
+  ArrowUpRight,
+  TrendingUp,
+  TrendingDown,
+  Clock,
+  Coins,
+  Calendar,
+  CheckCircle2,
+  FileText,
+  Building,
+  User,
+  Check,
+  Trash2,
+} from 'lucide-react';
+
+interface ProjectDetailsProps {
+  project: Project;
+  onBack: () => void;
+  onEditProject: () => void;
+  onAddIncomeForProject: (projectId: string) => void;
+  onAddExpenseForProject: (projectId: string) => void;
+  onSelectTransaction: (txn: Transaction) => void;
+}
+
+export const ProjectDetails: React.FC<ProjectDetailsProps> = ({
+  project,
+  onBack,
+  onEditProject,
+  onAddIncomeForProject,
+  onAddExpenseForProject,
+  onSelectTransaction,
+}) => {
+  const { getProjectSummary, transactions, markTransactionPaid } = useApp();
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+
+  const summary = getProjectSummary(project.id);
+
+  // Project-specific transactions
+  const projectTransactions = useMemo(() => {
+    return transactions.filter((t) => t.projectId === project.id);
+  }, [transactions, project.id]);
+
+  const percentCollected =
+    summary.contractAmount > 0
+      ? Math.min(100, Math.round((summary.totalCollections / summary.contractAmount) * 100))
+      : 0;
+
+  return (
+    <div className="space-y-4 pb-20">
+      {/* Top Navigation & Action Header */}
+      <div className="bg-white dark:bg-slate-900 rounded-3xl p-4 border border-slate-200 dark:border-slate-800 shadow-xs flex items-center justify-between">
+        <button
+          onClick={onBack}
+          type="button"
+          className="p-2 -ml-1 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white rounded-xl flex items-center gap-1 font-bold text-xs"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          <span>All Projects</span>
+        </button>
+
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={onEditProject}
+            type="button"
+            className="p-2 text-slate-600 dark:text-slate-400 hover:text-amber-500 rounded-xl flex items-center gap-1 text-xs font-semibold"
+            title="Edit Project Scope"
+          >
+            <Edit2 className="w-3.5 h-3.5" />
+            <span>Edit Project</span>
+          </button>
+
+          <button
+            onClick={() => setShowDeleteDialog(true)}
+            type="button"
+            className="p-2 text-rose-500 hover:text-rose-700 hover:bg-rose-50 dark:hover:bg-rose-950/40 rounded-xl flex items-center gap-1 text-xs font-semibold transition-colors"
+            title="Delete Project"
+            aria-label="Delete project"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            <span>Delete</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Main Project Overview Card */}
+      <div className="bg-gradient-to-br from-slate-900 via-slate-850 to-slate-900 text-white rounded-3xl p-5 shadow-xl border border-amber-500/30 relative overflow-hidden space-y-3">
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-amber-400 block mb-1">
+              {project.projectType}
+            </span>
+            <h1 className="text-xl font-black text-white tracking-tight">
+              {project.name}
+            </h1>
+            <p className="text-xs text-slate-300 mt-0.5">
+              Client: <strong className="text-white">{project.clientName}</strong>
+            </p>
+          </div>
+
+          <span
+            className={`text-xs font-bold px-2.5 py-0.5 rounded-full flex-shrink-0 ${
+              project.status === 'Active'
+                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                : 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
+            }`}
+          >
+            {project.status}
+          </span>
+        </div>
+
+        {/* Contract Amount Hero */}
+        <div className="pt-2 border-t border-white/10">
+          <span className="text-[11px] text-slate-400 block">Total Agreed Contract Amount:</span>
+          <div className="text-2xl font-black font-mono text-white mt-0.5">
+            {formatPeso(summary.contractAmount)}
+          </div>
+        </div>
+
+        {/* Collections Progress Bar */}
+        <div className="space-y-1.5 pt-1">
+          <div className="flex justify-between text-xs font-semibold text-slate-300">
+            <span>Collected: {formatPeso(summary.totalCollections)} ({percentCollected}%)</span>
+            <span className="text-amber-400 font-mono">Unpaid: {formatPeso(summary.remainingClientBalance)}</span>
+          </div>
+          <div className="h-2 w-full bg-white/10 rounded-full overflow-hidden">
+            <div
+              style={{ width: `${percentCollected}%` }}
+              className="h-full bg-emerald-400 rounded-full transition-all duration-300"
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Quick Action Buttons for this Project */}
+      <div className="grid grid-cols-2 gap-2.5">
+        <button
+          onClick={() => onAddIncomeForProject(project.id)}
+          type="button"
+          className="p-3 rounded-2xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold flex items-center justify-center gap-2 shadow-md shadow-emerald-600/20 active:scale-98 transition-all text-xs"
+        >
+          <ArrowDownLeft className="w-4 h-4 stroke-[2.5]" />
+          <span>+ Add Client Payment</span>
+        </button>
+
+        <button
+          onClick={() => onAddExpenseForProject(project.id)}
+          type="button"
+          className="p-3 rounded-2xl bg-rose-600 hover:bg-rose-700 text-white font-bold flex items-center justify-center gap-2 shadow-md shadow-rose-600/20 active:scale-98 transition-all text-xs"
+        >
+          <ArrowUpRight className="w-4 h-4 stroke-[2.5]" />
+          <span>- Add Project Expense</span>
+        </button>
+      </div>
+
+      {/* Project Financial Summary Cards (Requirement) */}
+      <div className="grid grid-cols-2 gap-3">
+        {/* Remaining Client Balance */}
+        <div className="bg-white dark:bg-slate-900 rounded-2xl p-4 border border-slate-200 dark:border-slate-800 shadow-xs">
+          <div className="flex items-center gap-1.5 text-slate-500 dark:text-slate-400 text-xs font-semibold">
+            <Clock className="w-4 h-4 text-amber-500" />
+            <span>Remaining Client Balance</span>
+          </div>
+          <div className="text-lg font-black text-amber-600 dark:text-amber-400 mt-1.5 font-mono truncate">
+            {formatPeso(summary.remainingClientBalance)}
+          </div>
+          <span className="text-[10px] text-slate-400 mt-0.5 block">Contract - Collections</span>
+        </div>
+
+        {/* Actual Project Cost */}
+        <div className="bg-white dark:bg-slate-900 rounded-2xl p-4 border border-slate-200 dark:border-slate-800 shadow-xs">
+          <div className="flex items-center gap-1.5 text-slate-500 dark:text-slate-400 text-xs font-semibold">
+            <TrendingDown className="w-4 h-4 text-rose-500" />
+            <span>Actual Project Cost</span>
+          </div>
+          <div className="text-lg font-black text-rose-600 dark:text-rose-400 mt-1.5 font-mono truncate">
+            {formatPeso(summary.actualProjectCost)}
+          </div>
+          <div className="text-[10px] text-slate-400 mt-0.5 flex items-center gap-1.5 flex-wrap">
+            <span>Paid: {formatPeso(summary.paidExpenses)}</span>
+            {summary.unpaidExpenses > 0 && (
+              <span className="text-amber-600 dark:text-amber-400 font-bold">• Unpaid: {formatPeso(summary.unpaidExpenses)}</span>
+            )}
+          </div>
+        </div>
+
+                {/* Paid Expenses */}
+        <div className='bg-white dark:bg-slate-900 rounded-2xl p-4 border border-slate-200 dark:border-slate-800 shadow-xs'>
+          <div className='flex items-center gap-1.5 text-slate-500 dark:text-slate-400 text-xs font-semibold'>
+            <CheckCircle2 className='w-4 h-4 text-emerald-500' />
+            <span>Paid Expenses</span>
+          </div>
+          <div className='text-lg font-black text-emerald-600 dark:text-emerald-400 mt-1.5 font-mono truncate'>
+            {formatPeso(summary.paidExpenses)}
+          </div>
+          <span className='text-[10px] text-slate-400 mt-0.5 block'>Already paid expenses</span>
+        </div>
+
+        {/* Unpaid Expenses */}
+        <div className='bg-white dark:bg-slate-900 rounded-2xl p-4 border border-slate-200 dark:border-slate-800 shadow-xs'>
+          <div className='flex items-center gap-1.5 text-slate-500 dark:text-slate-400 text-xs font-semibold'>
+            <Clock className='w-4 h-4 text-amber-500' />
+            <span>Unpaid Expenses</span>
+          </div>
+          <div className='text-lg font-black text-amber-600 dark:text-amber-400 mt-1.5 font-mono truncate'>
+            {formatPeso(summary.unpaidExpenses)}
+          </div>
+          <span className='text-[10px] text-slate-400 mt-0.5 block'>Outstanding payables</span>
+        </div>
+
+{/* Estimated Project Cost */}
+        <div className="bg-white dark:bg-slate-900 rounded-2xl p-4 border border-slate-200 dark:border-slate-800 shadow-xs">
+          <div className="flex items-center gap-1.5 text-slate-500 dark:text-slate-400 text-xs font-semibold">
+            <Coins className="w-4 h-4 text-blue-500" />
+            <span>Estimated Project Cost</span>
+          </div>
+          <div className="text-lg font-black text-slate-900 dark:text-white mt-1.5 font-mono truncate">
+            {formatPeso(summary.estimatedProjectCost)}
+          </div>
+          <span className="text-[10px] text-slate-400 mt-0.5 block">Budgeted expenditures</span>
+        </div>
+
+        {/* Estimated Project Profit */}
+        <div className="bg-white dark:bg-slate-900 rounded-2xl p-4 border border-slate-200 dark:border-slate-800 shadow-xs">
+          <div className="flex items-center gap-1.5 text-slate-500 dark:text-slate-400 text-xs font-semibold">
+            <TrendingUp className="w-4 h-4 text-emerald-500" />
+            <span>Estimated Profit</span>
+          </div>
+          <div className="text-lg font-black text-emerald-600 dark:text-emerald-400 mt-1.5 font-mono truncate">
+            {formatPeso(summary.estimatedProjectProfit)}
+          </div>
+          <span className="text-[10px] text-slate-400 mt-0.5 block">Contract - Estimated Cost</span>
+        </div>
+      </div>
+
+      {/* Actual Project Profit Hero Card */}
+      <div className="bg-white dark:bg-slate-900 rounded-3xl p-5 border border-slate-200 dark:border-slate-800 shadow-xs">
+        <div className="flex items-center justify-between">
+          <div>
+            <span className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 block">
+              Actual Project Profit (To Date)
+            </span>
+            <p className="text-[11px] text-slate-400 mt-0.5">
+              Total Collections Received ({formatPeso(summary.totalCollections)}) - Actual Costs ({formatPeso(summary.actualProjectCost)})
+            </p>
+          </div>
+
+          <span
+            className={`text-xs font-bold px-2.5 py-1 rounded-full ${
+              summary.actualProjectProfit >= 0
+                ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300'
+                : 'bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-300'
+            }`}
+          >
+            {summary.actualProjectProfit >= 0 ? 'In Profit' : 'Deficit'}
+          </span>
+        </div>
+
+        <div
+          className={`text-2xl font-black font-mono tracking-tight mt-2 ${
+            summary.actualProjectProfit >= 0
+              ? 'text-emerald-600 dark:text-emerald-400'
+              : 'text-rose-600 dark:text-rose-400'
+          }`}
+        >
+          {formatPeso(summary.actualProjectProfit)}
+        </div>
+      </div>
+
+      {/* Project Financial Records & Transactions List */}
+      <div className="bg-white dark:bg-slate-900 rounded-3xl p-5 border border-slate-200 dark:border-slate-800 shadow-xs space-y-3">
+        <div className="flex items-center justify-between">
+          <h3 className="text-xs font-extrabold uppercase tracking-wider text-slate-900 dark:text-white">
+            Project Financial Records ({projectTransactions.length})
+          </h3>
+          <span className="text-[11px] text-slate-400">All Project Billings & Costs</span>
+        </div>
+
+        {projectTransactions.length === 0 ? (
+          <div className="text-center py-6 border border-dashed border-slate-200 dark:border-slate-800 rounded-2xl p-4">
+            <FileText className="w-8 h-8 text-slate-300 dark:text-slate-700 mx-auto mb-2" />
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              No transactions recorded for this project yet.
+            </p>
+            <div className="flex justify-center gap-2 mt-3">
+              <button
+                onClick={() => onAddIncomeForProject(project.id)}
+                type="button"
+                className="px-3 py-1.5 rounded-xl bg-emerald-600 text-white text-xs font-bold hover:bg-emerald-700"
+              >
+                + Client Payment
+              </button>
+              <button
+                onClick={() => onAddExpenseForProject(project.id)}
+                type="button"
+                className="px-3 py-1.5 rounded-xl bg-rose-600 text-white text-xs font-bold hover:bg-rose-700"
+              >
+                - Project Expense
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="divide-y divide-slate-100 dark:divide-slate-800">
+            {projectTransactions.map((t) => (
+              <div
+                key={t.id}
+                onClick={() => onSelectTransaction(t)}
+                className="py-2.5 flex items-center justify-between cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-850 px-1 rounded-xl transition-colors"
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div
+                    className={`w-8 h-8 rounded-xl flex items-center justify-center text-xs font-bold ${
+                      t.type === 'income'
+                        ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400'
+                        : 'bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-400'
+                    }`}
+                  >
+                    {t.type === 'income' ? '+' : '-'}
+                  </div>
+                  <div className="truncate">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <p className="text-xs font-bold text-slate-800 dark:text-slate-200 truncate">
+                        {t.description || t.category}
+                      </p>
+                      {t.type === 'expense' && t.paymentStatus === 'unpaid' && (
+                        <span className="px-1.5 py-0.2 rounded-md text-[9px] font-black uppercase tracking-wider bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300 border border-amber-300 dark:border-amber-700">
+                          Unpaid
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[10px] text-slate-400 truncate">
+                      {t.category} • {t.paymentMethod} {t.supplierOrPayee ? `• ${t.supplierOrPayee}` : ''} • {t.date}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="text-right flex flex-col items-end gap-1 flex-shrink-0">
+                  <span
+                    className={`font-mono font-bold text-xs ${
+                      t.type === 'income'
+                        ? 'text-emerald-600 dark:text-emerald-400'
+                        : 'text-rose-600 dark:text-rose-400'
+                    }`}
+                  >
+                    {t.type === 'income' ? '+' : '-'}
+                    {formatPeso(t.amount)}
+                  </span>
+
+                  {t.type === 'expense' && t.paymentStatus === 'unpaid' && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        markTransactionPaid(t.id);
+                      }}
+                      type="button"
+                      className="px-2 py-0.5 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-slate-950 text-[10px] font-black shadow-xs flex items-center gap-1 active:scale-95 transition-all"
+                      title="Mark as paid"
+                    >
+                      <Check className="w-3 h-3 stroke-[3]" />
+                      <span>Mark Paid</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Delete Project Confirmation Dialog */}
+      <DeleteProjectDialog
+        isOpen={showDeleteDialog}
+        project={project}
+        onClose={() => setShowDeleteDialog(false)}
+        onDeleted={() => {
+          setShowDeleteDialog(false);
+          onBack();
+        }}
+      />
+    </div>
+  );
+};

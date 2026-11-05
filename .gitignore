@@ -1,0 +1,28 @@
+﻿node_modules/
+dist/
+build/
+.env
+.env.*
+!.env.example
+**/keystore.properties
+*.jks
+*.keystore
+*.p12
+local.properties
+.idea/
+*.iml
+android/.gradle/
+android/**/build/
+*.pem
+*.key
+*.mobileprovision
+*service-account*.json
+*credentials*.json
+
+# Android local files and backups
+android/local.properties
+android/app/build.gradle.backup
+
+# Android local files and backups
+android/local.properties
+android/app/build.gradle.backup
